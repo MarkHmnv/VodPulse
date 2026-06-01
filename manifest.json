@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
   "name": "VodPulse",
-  "version": "1.0",
+  "version": "1.0.0",
   "description": "Adds a chat activity graph to the Twitch player, similar to YouTube's \"most replayed\" feature.",
+  "icons": {
+    "16": "icon128.png",
+    "32": "icon128.png",
+    "48": "icon128.png",
+    "128": "icon128.png"
+  },
   "permissions": [],
   "host_permissions": ["https://*.twitch.tv/*", "https://gql.twitch.tv/*"],
   "content_scripts": [

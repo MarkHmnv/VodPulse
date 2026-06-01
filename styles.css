@@ -1,46 +1,185 @@
 .vodpulse-btn {
-  background: #9147ff;
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(135deg, #9147ff 0%, #772ce8 50%, #6c2bd9 100%);
   color: #fff;
   border: none;
-  border-radius: 4px;
-  padding: 0 10px;
+  border-radius: 6px;
+  padding: 0 14px;
   height: 30px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   margin-left: 10px;
-  font-size: 13px;
+  font-size: 12px;
+  font-family:
+    "Inter", "Roobert", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(145, 71, 255, 0.3);
+  letter-spacing: 0.02em;
+  z-index: 1;
+}
+
+.vodpulse-btn:hover {
+  background: linear-gradient(135deg, #a970ff 0%, #9147ff 50%, #772ce8 100%);
+  box-shadow: 0 4px 16px rgba(145, 71, 255, 0.45);
+  transform: translateY(-1px);
+}
+
+.vodpulse-btn:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(145, 71, 255, 0.25);
+}
+
+.vodpulse-btn:disabled {
+  cursor: default;
+  transform: none;
+}
+
+.vodpulse-btn-icon {
   display: flex;
   align-items: center;
-  transition: background 0.2s;
+  flex-shrink: 0;
+  line-height: 0;
 }
-.vodpulse-btn:hover {
-  background: #772ce8;
+
+.vodpulse-btn-text {
+  position: relative;
+  z-index: 2;
+  white-space: nowrap;
 }
-.vodpulse-btn:disabled {
-  background: #3a3a3a;
-  color: #888;
-  cursor: wait;
+
+.vodpulse-btn-progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 0%;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.1);
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 0;
+  pointer-events: none;
+}
+
+.vodpulse-btn--loading {
+  background: linear-gradient(135deg, #3a3a4a 0%, #2a2a3a 100%);
+  box-shadow: 0 2px 8px rgba(100, 100, 140, 0.2);
+}
+
+.vodpulse-btn--loading .vodpulse-btn-progress {
+  background: linear-gradient(
+    90deg,
+    rgba(145, 71, 255, 0.25),
+    rgba(169, 112, 255, 0.4)
+  );
+}
+
+.vodpulse-btn--loading::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(169, 112, 255, 0.12),
+    transparent
+  );
+  animation: vodpulse-shimmer 1.8s ease-in-out infinite;
+  z-index: 1;
+  pointer-events: none;
+}
+
+@keyframes vodpulse-shimmer {
+  0% {
+    left: -100%;
+  }
+  100% {
+    left: 200%;
+  }
+}
+
+.vodpulse-btn--loading .vodpulse-btn-icon {
+  animation: vodpulse-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes vodpulse-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.vodpulse-btn--done {
+  background: linear-gradient(135deg, #00c868 0%, #00a854 100%);
+  box-shadow: 0 2px 12px rgba(0, 200, 104, 0.35);
+}
+
+.vodpulse-btn--done .vodpulse-btn-progress {
+  background: rgba(255, 255, 255, 0.08);
 }
 
 #vodpulse-graph-container {
   position: absolute;
-  bottom: 85px;
-  left: 2rem;
-  right: 2rem;
-  height: 60px;
-  z-index: 0;
+  bottom: 40px;
+  left: 0;
+  right: 0;
+  height: 64px;
+  z-index: 2;
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.2s ease-in-out;
 }
 
-.video-player__container:not(.video-player--idle) #vodpulse-graph-container,
-.video-player__container:hover #vodpulse-graph-container {
+.video-player__container:hover:not(.video-player--idle)
+  #vodpulse-graph-container {
   opacity: 1;
 }
 
 #vodpulse-canvas {
-  width: 100%;
-  height: 100%;
   display: block;
+}
+
+#vodpulse-tooltip {
+  position: fixed;
+  z-index: 99999;
+  pointer-events: none;
+  background: rgba(14, 14, 18, 0.92);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(169, 112, 255, 0.2);
+  border-radius: 6px;
+  padding: 4px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  font-family:
+    "Inter", "Roobert", "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+.vodpulse-tooltip-time {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  font-weight: 500;
+}
+
+.vodpulse-tooltip-sep {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.2);
+}
+
+.vodpulse-tooltip-count {
+  font-size: 11px;
+  color: #bf94ff;
+  font-weight: 700;
 }
