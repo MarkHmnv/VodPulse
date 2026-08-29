@@ -1,11 +1,30 @@
 const GQL = "https://gql.twitch.tv/gql";
 const DEFAULT_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
+// `first` is capped server-side: Twitch ignores it and returns a fixed page of
+// ~54-59 edges. 100 is simply the largest accepted value.
+const PAGE_LIMIT = 100;
+// A page this size that sits entirely in one second means the cap was hit
+// inside that second.
+const SATURATED_PAGE = 50;
+const CONCURRENCY = 60;
+// Worker queries packed into one HTTP request. Measured on the live endpoint
+// (60 queries/round, median of 3): 1 -> 775ms, 5 -> 331ms, 10 -> 407ms,
+// 30 -> 620ms — the server handles a large batch serially.
+const GQL_BATCH = 5;
+
 let lastVideoId = null;
 let graphData = null;
-let resizeObserver = null;
+let layoutObserver = null;
 let tooltipEl = null;
+let tooltipTime = null;
+let tooltipCount = null;
 let isFetching = false;
+
+let binCounts = null;
+let binTotal = 0;
+let binDur = 0;
+let canvasCtx = null;
 
 const getCookie = (name) => {
   const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
@@ -21,6 +40,20 @@ const AUTH = (() => {
   };
 })();
 
+// A shared backoff: a rate limit pauses every worker, not just the one that
+// hit it.
+let throttledUntil = 0;
+let throttleStep = 0;
+
+function throttle(ms) {
+  throttledUntil = Math.max(throttledUntil, Date.now() + ms);
+}
+
+async function awaitThrottle() {
+  const wait = throttledUntil - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+}
+
 async function gql(payload) {
   const headers = {
     "Client-Id": AUTH.id,
@@ -28,269 +61,435 @@ async function gql(payload) {
   };
   if (AUTH.token) headers["Authorization"] = AUTH.token;
 
+  const body = JSON.stringify(payload);
+
   for (let attempt = 0; attempt < 3; attempt++) {
+    await awaitThrottle();
     try {
-      const resp = await fetch(GQL, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-      });
+      const resp = await fetch(GQL, { method: "POST", headers, body });
       if (!resp.ok) {
-        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        const retryAfter = Number(resp.headers.get("Retry-After"));
+        throttleStep = Math.min(throttleStep + 1, 6);
+        throttle(
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : 250 * Math.pow(2, throttleStep),
+        );
         continue;
       }
+      throttleStep = Math.max(0, throttleStep - 1);
       return await resp.json();
     } catch {
-      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      throttleStep = Math.min(throttleStep + 1, 6);
+      throttle(300 * Math.pow(2, throttleStep));
     }
   }
-  return Array.isArray(payload) ? payload.map(() => ({})) : {};
+  return Array.isArray(payload) ? payload.map(() => null) : null;
+}
+
+// The endpoint accepts an array of operations in one POST; fall back to one
+// request per query if it ever stops doing so.
+let batchSupported = true;
+
+async function gqlMulti(queries) {
+  if (batchSupported) {
+    const res = await gql(queries);
+    if (Array.isArray(res) && res.length === queries.length) return res;
+    batchSupported = false;
+  }
+  return Promise.all(queries.map((q) => gql(q)));
+}
+
+// Twitch gates `after:` behind its integrity challenge, which a content script
+// cannot answer, so this is tried once and then disabled for the session.
+let cursorPagingAvailable = true;
+
+function buildCursorQuery(videoId, offset, after) {
+  return {
+    operationName: "VideoCommentsCursor",
+    query:
+      "query VideoCommentsCursor($id:ID!,$off:Int,$after:Cursor,$lim:Int){video(id:$id){comments(contentOffsetSeconds:$off,after:$after,first:$lim){pageInfo{hasNextPage}edges{cursor node{contentOffsetSeconds id}}}}}",
+    variables: {
+      id: videoId,
+      off: after ? null : Math.floor(offset),
+      after: after || null,
+      lim: PAGE_LIMIT,
+    },
+  };
 }
 
 function buildCommentsQuery(videoId, offset) {
   return {
     operationName: "VideoComments",
-    query: `query VideoComments($id:ID!,$off:Int,$lim:Int){
-      video(id:$id){
-        comments(contentOffsetSeconds:$off,first:$lim){
-          edges{node{contentOffsetSeconds id}}
-        }
-      }
-    }`,
+    query:
+      "query VideoComments($id:ID!,$off:Int,$lim:Int){video(id:$id){comments(contentOffsetSeconds:$off,first:$lim){pageInfo{hasNextPage}edges{node{contentOffsetSeconds id}}}}}",
     variables: { id: videoId, off: Math.floor(offset), lim: PAGE_LIMIT },
   };
 }
 
-const PAGE_LIMIT = 100;
+function advanceWorker(w, res, counts) {
+  const comments = res?.data?.video?.comments;
 
-async function fetchSegment(videoId, start, end, workerId, progressTracker) {
-  const stamps = [];
-  const seen = new Set();
-  let offset = start;
-  let emptyStreak = 0;
-
-  while (offset < end) {
-    if (videoId !== getCurrentVideoId()) return null;
-
-    try {
-      const res = await gql(buildCommentsQuery(videoId, offset));
-      const edges = res?.data?.video?.comments?.edges || [];
-
-      if (!edges.length) {
-        emptyStreak++;
-        const skip = Math.min(
-          10 * Math.pow(3, Math.min(emptyStreak - 1, 4)),
-          end - offset,
-        );
-        offset += Math.max(skip, 1);
-        if (typeof workerId === "number") {
-          progressTracker[workerId] = Math.min(offset, end) - start;
-        }
-        continue;
-      }
-
-      emptyStreak = 0;
-      const maxT = processEdges(edges, start, end, seen, stamps);
-      let next = maxT;
-      if (edges.length >= PAGE_LIMIT) {
-        const minT = edges[0].node.contentOffsetSeconds;
-        if (minT === maxT) next = maxT + 1;
-      }
-      if (next <= offset) next = offset + 1;
-      offset = next;
-      if (typeof workerId === "number") {
-        progressTracker[workerId] = Math.min(offset, end) - start;
-      }
-    } catch {
-      await new Promise((r) => setTimeout(r, 1000));
+  if (!comments) {
+    // Skip ahead eventually, so a broken window cannot stall the run.
+    if (++w.failures >= 5) {
+      w.failures = 0;
+      w.offset = Math.min(w.offset + 10, w.end);
     }
+    if (w.offset >= w.end) w.done = true;
+    w.progress = Math.min(w.offset, w.end) - w.start;
+    return -1;
   }
-  return stamps;
+
+  w.failures = 0;
+  const edges = comments.edges || [];
+  let saturated = -1;
+
+  if (!edges.length) {
+    w.emptyStreak++;
+    const skip = Math.min(
+      10 * Math.pow(3, Math.min(w.emptyStreak - 1, 4)),
+      w.end - w.offset,
+    );
+    w.offset += Math.max(skip, 1);
+  } else {
+    w.emptyStreak = 0;
+
+    // Offsets only move forward, so a message can be returned twice only by
+    // two adjacent pages — a one-page Set is enough to dedupe.
+    const prev = w.prevIds;
+    const cur = new Set();
+    let maxT = -Infinity;
+    const minT = edges[0].node.contentOffsetSeconds;
+
+    for (let i = 0; i < edges.length; i++) {
+      const node = edges[i].node;
+      const id = node.id;
+      const t = node.contentOffsetSeconds;
+      cur.add(id);
+      if (t >= w.start && t < w.end && !prev.has(id)) {
+        const s = Math.floor(t);
+        if (s >= 0 && s < counts.length) counts[s]++;
+      }
+      if (t > maxT) maxT = t;
+    }
+    w.prevIds = cur;
+
+    // A whole page inside one second means offset paging has hit its floor:
+    // the rest of that second is only reachable via a cursor.
+    let next = maxT;
+    if (minT === maxT) {
+      next = maxT + 1;
+      if (maxT >= w.start && maxT < w.end && edges.length >= SATURATED_PAGE) {
+        saturated = maxT;
+      }
+    }
+    if (next <= w.offset) next = w.offset + 1;
+    w.offset = next;
+  }
+
+  if (w.offset >= w.end) w.done = true;
+  w.progress = Math.min(w.offset, w.end) - w.start;
+  return saturated;
 }
 
-function processEdges(edges, start, end, seen, stamps) {
-  let maxT = -Infinity;
-  for (const { node } of edges) {
-    const t = node.contentOffsetSeconds;
-    if (t >= start && t < end && !seen.has(node.id)) {
-      seen.add(node.id);
-      stamps.push(t);
+// Walks the cursor chain for one saturated second.
+// Returns "ok" (second fully counted), "unresolved" (transient failure, the
+// cursor path stays enabled) or "blocked" (Twitch refused the `after:`
+// argument, so the path is disabled for the rest of the session).
+async function drainSaturatedSecond(id, second, knownIds, counts) {
+  let res = await gql(buildCursorQuery(id, second, null));
+  let comments = res?.data?.video?.comments;
+  // Carries no cursor, so its failure says nothing about cursor paging.
+  if (!comments) return "unresolved";
+
+  const seen = new Set(knownIds);
+  let guard = 0;
+
+  for (;;) {
+    const edges = comments.edges || [];
+    if (!edges.length) return "ok";
+
+    let sameSecond = true;
+    for (let i = 0; i < edges.length; i++) {
+      const node = edges[i].node;
+      if (node.contentOffsetSeconds !== second) {
+        sameSecond = false;
+        continue;
+      }
+      if (!seen.has(node.id)) {
+        seen.add(node.id);
+        counts[second]++;
+      }
     }
-    if (t > maxT) maxT = t;
+    if (!sameSecond || !comments.pageInfo?.hasNextPage) return "ok";
+    if (++guard > 40) return "ok";
+
+    res = await gql(
+      buildCursorQuery(id, second, edges[edges.length - 1].cursor),
+    );
+    comments = res?.data?.video?.comments;
+    if (!comments) return "blocked";
   }
-  return maxT;
 }
 
 async function fetchChat(id, onProgress) {
   const d = await gql({
-    query: `query V($id:ID!){video(id:$id){lengthSeconds}}`,
+    query: "query V($id:ID!){video(id:$id){lengthSeconds}}",
     variables: { id },
   });
 
-  const dur = d.data?.video?.lengthSeconds;
+  const dur = d?.data?.video?.lengthSeconds;
   if (!dur) return null;
 
-  const CONCURRENCY = 20;
-  const segmentSize = Math.ceil(dur / CONCURRENCY);
-  const progressTracker = new Array(CONCURRENCY).fill(0);
+  const counts = new Int32Array(dur);
+  let truncatedSeconds = 0;
 
-  const report = () =>
-    onProgress(
-      progressTracker.reduce((a, b) => a + b, 0),
-      dur,
-    );
+  const workerCount = Math.max(1, Math.min(CONCURRENCY, Math.ceil(dur / 60)));
+  const segmentSize = Math.ceil(dur / workerCount);
 
+  const workers = [];
+  for (let i = 0; i < workerCount; i++) {
+    const start = i * segmentSize;
+    const end = Math.min((i + 1) * segmentSize, dur);
+    if (start >= end) continue;
+    workers.push({
+      start,
+      end,
+      offset: start,
+      emptyStreak: 0,
+      failures: 0,
+      prevIds: new Set(),
+      progress: 0,
+      done: false,
+    });
+  }
+
+  const report = () => {
+    let total = 0;
+    for (let i = 0; i < workers.length; i++) total += workers[i].progress;
+    onProgress(total, dur);
+  };
   const interval = setInterval(report, 400);
 
-  const results = await Promise.all(
-    Array.from({ length: CONCURRENCY }, (_, i) =>
-      fetchSegment(
-        id,
-        i * segmentSize,
-        Math.min((i + 1) * segmentSize, dur),
-        i,
-        progressTracker,
-      ),
-    ),
-  );
+  try {
+    for (;;) {
+      if (id !== getCurrentVideoId()) return null;
 
-  clearInterval(interval);
+      const active = workers.filter((w) => !w.done);
+      if (!active.length) break;
 
-  if (results.some((r) => r === null)) return null;
+      const chunks = [];
+      for (let i = 0; i < active.length; i += GQL_BATCH) {
+        chunks.push(active.slice(i, i + GQL_BATCH));
+      }
 
-  return {
-    stamps: results.flat().sort((a, b) => a - b),
-    dur,
-  };
+      const responses = await Promise.all(
+        chunks.map((chunk) =>
+          gqlMulti(chunk.map((w) => buildCommentsQuery(id, w.offset))),
+        ),
+      );
+
+      const saturated = [];
+      for (let c = 0; c < chunks.length; c++) {
+        const chunk = chunks[c];
+        const res = responses[c];
+        for (let i = 0; i < chunk.length; i++) {
+          const w = chunk[i];
+          const second = advanceWorker(w, res[i], counts);
+          if (second >= 0) saturated.push({ second, ids: w.prevIds });
+        }
+      }
+
+      // Try to top up seconds the page cap truncated.
+      for (let i = 0; i < saturated.length; i++) {
+        truncatedSeconds++;
+        if (!cursorPagingAvailable) continue;
+        const outcome = await drainSaturatedSecond(
+          id,
+          saturated[i].second,
+          saturated[i].ids,
+          counts,
+        );
+        if (outcome === "ok") truncatedSeconds--;
+        else if (outcome === "blocked") cursorPagingAvailable = false;
+      }
+    }
+  } finally {
+    clearInterval(interval);
+  }
+
+  report();
+  if (truncatedSeconds > 0) {
+    console.warn(
+      `VodPulse: ${truncatedSeconds} second(s) exceeded Twitch's page cap and are undercounted ` +
+        `(cursor paging ${cursorPagingAvailable ? "did not resolve them" : "is blocked by Twitch's integrity check"}).`,
+    );
+  }
+  return { counts, dur };
 }
 
-function drawGraph(stamps, dur) {
-  graphData = { stamps, dur };
+let renderPending = false;
 
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => {
+    renderPending = false;
+    const container = document.getElementById("vodpulse-graph-container");
+    if (container && graphData) {
+      renderCanvas(container, graphData.counts, graphData.dur);
+    }
+  });
+}
+
+function drawGraph(counts, dur) {
+  graphData = { counts, dur };
   const container = document.getElementById("vodpulse-graph-container");
   if (!container) return;
-
-  if (!resizeObserver) {
-    resizeObserver = new ResizeObserver(() => {
-      if (graphData) renderCanvas(container, graphData.stamps, graphData.dur);
-    });
-    resizeObserver.observe(container);
-  }
-
-  renderCanvas(container, stamps, dur);
+  renderCanvas(container, counts, dur);
 }
 
-function renderCanvas(container, stamps, dur) {
-  if (!container.querySelector("canvas")) {
-    const cvs = document.createElement("canvas");
-    cvs.id = "vodpulse-canvas";
-    container.appendChild(cvs);
-  }
-
-  const cvs = container.querySelector("canvas");
+function renderCanvas(container, counts, dur) {
   const rect = container.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  cvs.width = rect.width * dpr;
-  cvs.height = rect.height * dpr;
-  cvs.style.width = rect.width + "px";
-  cvs.style.height = rect.height + "px";
-
-  const ctx = cvs.getContext("2d");
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, rect.width, rect.height);
-
   const W = rect.width;
   const H = rect.height;
+  if (W < 1 || H < 1) return;
+
+  let cvs = container.querySelector("canvas");
+  if (!cvs) {
+    cvs = document.createElement("canvas");
+    cvs.id = "vodpulse-canvas";
+    container.appendChild(cvs);
+    canvasCtx = null;
+  }
+  if (!canvasCtx || canvasCtx.canvas !== cvs) canvasCtx = cvs.getContext("2d");
+
+  const dpr = window.devicePixelRatio || 1;
+  const pxW = Math.round(W * dpr);
+  const pxH = Math.round(H * dpr);
+  if (cvs.width !== pxW || cvs.height !== pxH) {
+    cvs.width = pxW;
+    cvs.height = pxH;
+    cvs.style.width = W + "px";
+    cvs.style.height = H + "px";
+  }
+
+  const ctx = canvasCtx;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
 
   const numBins = Math.max(Math.ceil(W / 3), 10);
-  const bins = new Uint32Array(numBins);
+  const bins = new Float64Array(numBins);
   const secPerBin = dur / numBins;
 
-  for (const t of stamps) {
-    const i = Math.min(Math.floor(t / secPerBin), numBins - 1);
-    bins[i]++;
+  for (let s = 0; s < dur; s++) {
+    const c = counts[s];
+    if (!c) continue;
+    let i = (s / secPerBin) | 0;
+    if (i >= numBins) i = numBins - 1;
+    bins[i] += c;
   }
 
   let max = 1;
-  for (let i = 0; i < bins.length; i++) {
-    if (bins[i] > max) max = bins[i];
-  }
+  for (let i = 0; i < numBins; i++) if (bins[i] > max) max = bins[i];
 
-  const points = [];
+  const ys = new Float64Array(numBins);
   for (let i = 0; i < numBins; i++) {
-    const x = (i / (numBins - 1)) * W;
-    const normalized = bins[i] / max;
-    const y = H - Math.pow(normalized, 1.3) * (H - 2);
-    points.push({ x, y });
+    ys[i] = H - Math.pow(bins[i] / max, 1.3) * (H - 2);
   }
 
-  const smoothed = [];
-  for (let i = 0; i < points.length; i++) {
-    const windowSize = 2;
-    let sumY = 0;
-    let count = 0;
-    for (
-      let j = Math.max(0, i - windowSize);
-      j <= Math.min(points.length - 1, i + windowSize);
-      j++
-    ) {
-      sumY += points[j].y;
-      count++;
-    }
-    smoothed.push({ x: points[i].x, y: sumY / count });
+  // Box blur via prefix sums: O(n) instead of O(n * window).
+  const WINDOW = 2;
+  const prefix = new Float64Array(numBins + 1);
+  for (let i = 0; i < numBins; i++) prefix[i + 1] = prefix[i] + ys[i];
+  const smoothY = new Float64Array(numBins);
+  for (let i = 0; i < numBins; i++) {
+    const lo = i - WINDOW > 0 ? i - WINDOW : 0;
+    const hi = i + WINDOW < numBins - 1 ? i + WINDOW : numBins - 1;
+    smoothY[i] = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
   }
+
+  // Build the path once and reuse it for all three passes.
+  const line = buildSmoothPath(smoothY, numBins, W);
+  const area = new Path2D(line);
+  area.lineTo(W, H);
+  area.lineTo(0, H);
+  area.closePath();
 
   ctx.save();
   ctx.filter = "blur(6px)";
   ctx.strokeStyle = "rgba(169, 112, 255, 0.5)";
   ctx.lineWidth = 4;
-  drawSmoothLine(ctx, smoothed);
-  ctx.stroke();
+  ctx.stroke(line);
   ctx.restore();
-
-  ctx.beginPath();
-  drawSmoothLine(ctx, smoothed);
-  ctx.lineTo(W, H);
-  ctx.lineTo(0, H);
-  ctx.closePath();
 
   const gradient = ctx.createLinearGradient(0, 0, 0, H);
   gradient.addColorStop(0, "rgba(169, 112, 255, 0.6)");
   gradient.addColorStop(0.5, "rgba(145, 71, 255, 0.25)");
   gradient.addColorStop(1, "rgba(145, 71, 255, 0.02)");
   ctx.fillStyle = gradient;
-  ctx.fill();
+  ctx.fill(area);
 
-  ctx.beginPath();
-  drawSmoothLine(ctx, smoothed);
   ctx.strokeStyle = "rgba(190, 150, 255, 0.9)";
   ctx.lineWidth = 1.5;
-  ctx.stroke();
+  ctx.stroke(line);
 
-  container._vodpulseBins = bins;
-  container._vodpulseMax = max;
-  container._vodpulseNumBins = numBins;
-  container._vodpulseDur = dur;
+  binCounts = bins;
+  binTotal = numBins;
+  binDur = dur;
 }
 
-function drawSmoothLine(ctx, pts) {
-  if (pts.length < 2) return;
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-
-  for (let i = 0; i < pts.length - 1; i++) {
-    const cp1x = (pts[i].x + pts[i + 1].x) / 2;
-    const cp1y = pts[i].y;
-    const cp2x = cp1x;
-    const cp2y = pts[i + 1].y;
-    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, pts[i + 1].x, pts[i + 1].y);
+function buildSmoothPath(ys, n, W) {
+  const path = new Path2D();
+  if (n < 2) return path;
+  const step = W / (n - 1);
+  path.moveTo(0, ys[0]);
+  for (let i = 0; i < n - 1; i++) {
+    const x0 = i * step;
+    const x1 = x0 + step;
+    const cpx = (x0 + x1) / 2;
+    path.bezierCurveTo(cpx, ys[i], cpx, ys[i + 1], x1, ys[i + 1]);
   }
+  return path;
+}
+
+let rectsDirty = true;
+let cachedGraphRect = null;
+let cachedMinY = 0;
+let cachedMaxY = 0;
+let pendingMouseX = 0;
+let pendingMouseY = 0;
+let tooltipRaf = 0;
+
+function invalidateRects() {
+  rectsDirty = true;
+}
+
+function findSeekbar() {
+  return (
+    document.querySelector(".seekbar-bar") ||
+    document.querySelector('[data-a-target="player-seekbar"]') ||
+    document.querySelector(".seekbar-interaction-area")
+  );
 }
 
 function ensureTooltip() {
   if (tooltipEl) return tooltipEl;
   tooltipEl = document.createElement("div");
   tooltipEl.id = "vodpulse-tooltip";
+
+  tooltipTime = document.createElement("span");
+  tooltipTime.className = "vodpulse-tooltip-time";
+
+  const sep = document.createElement("span");
+  sep.className = "vodpulse-tooltip-sep";
+  sep.textContent = "·";
+
+  tooltipCount = document.createElement("span");
+  tooltipCount.className = "vodpulse-tooltip-count";
+
+  tooltipEl.append(tooltipTime, sep, tooltipCount);
   document.body.appendChild(tooltipEl);
   return tooltipEl;
 }
@@ -305,60 +504,61 @@ function formatTime(seconds) {
 }
 
 function handleGraphMouseMove(e) {
+  if (!binCounts) return;
+  pendingMouseX = e.clientX;
+  pendingMouseY = e.clientY;
+  if (!tooltipRaf) tooltipRaf = requestAnimationFrame(flushTooltip);
+}
+
+function flushTooltip() {
+  tooltipRaf = 0;
+  if (!binCounts) return;
+
   const container = document.getElementById("vodpulse-graph-container");
-  if (!container || !container._vodpulseBins) return;
+  if (!container) return;
 
-  const rect = container.getBoundingClientRect();
-  const seekbar =
-    document.querySelector(".seekbar-bar") ||
-    document.querySelector('[data-a-target="player-seekbar"]') ||
-    document.querySelector(".seekbar-interaction-area");
-
-  let minY = rect.top;
-  let maxY = rect.bottom;
-  if (seekbar) {
-    const seekRect = seekbar.getBoundingClientRect();
-    minY = Math.min(rect.top, seekRect.top);
-    maxY = Math.max(rect.bottom, seekRect.bottom);
+  if (rectsDirty || !cachedGraphRect) {
+    cachedGraphRect = container.getBoundingClientRect();
+    const seekbar = findSeekbar();
+    if (seekbar) {
+      const seekRect = seekbar.getBoundingClientRect();
+      cachedMinY = Math.min(cachedGraphRect.top, seekRect.top);
+      cachedMaxY = Math.max(cachedGraphRect.bottom, seekRect.bottom);
+    } else {
+      cachedMinY = cachedGraphRect.top;
+      cachedMaxY = cachedGraphRect.bottom;
+    }
+    rectsDirty = false;
   }
 
+  const rect = cachedGraphRect;
   if (
-    e.clientX < rect.left ||
-    e.clientX > rect.right ||
-    e.clientY < minY ||
-    e.clientY > maxY
+    pendingMouseX < rect.left ||
+    pendingMouseX > rect.right ||
+    pendingMouseY < cachedMinY ||
+    pendingMouseY > cachedMaxY
   ) {
     hideTooltip();
     return;
   }
 
-  const x = e.clientX - rect.left;
-  const bins = container._vodpulseBins;
-  const numBins = container._vodpulseNumBins;
-  const dur = container._vodpulseDur;
+  const x = pendingMouseX - rect.left;
+  let binIndex = Math.floor((x / rect.width) * binTotal);
+  if (binIndex < 0) binIndex = 0;
+  if (binIndex >= binTotal) binIndex = binTotal - 1;
 
-  const binIndex = Math.min(
-    Math.floor((x / rect.width) * numBins),
-    numBins - 1,
-  );
-  const count = bins[binIndex] || 0;
-  const timeStart = (binIndex / numBins) * dur;
-  const timeEnd = ((binIndex + 1) / numBins) * dur;
+  const count = binCounts[binIndex] || 0;
+  const timeStart = (binIndex / binTotal) * binDur;
+  const timeEnd = ((binIndex + 1) / binTotal) * binDur;
 
   const tip = ensureTooltip();
-  const safeCount = String(count).replace(/[&<>/'"]/g, "");
-  const safeStart = formatTime(timeStart).replace(/[&<>/'"]/g, "");
-  const safeEnd = formatTime(timeEnd).replace(/[&<>/'"]/g, "");
-  tip.innerHTML = `
-    <span class="vodpulse-tooltip-time">${safeStart} – ${safeEnd}</span>
-    <span class="vodpulse-tooltip-sep">·</span>
-    <span class="vodpulse-tooltip-count">${safeCount} messages</span>
-  `;
+  tooltipTime.textContent = `${formatTime(timeStart)} – ${formatTime(timeEnd)}`;
+  tooltipCount.textContent = `${count} messages`;
   tip.style.opacity = "1";
 
   // Fixed vertical position just above seekbar, below hover preview card
   tip.style.top = rect.bottom - 24 + "px";
-  tip.style.left = e.clientX + "px";
+  tip.style.left = pendingMouseX + "px";
   tip.style.transform = "translateX(-50%)";
 }
 
@@ -379,15 +579,24 @@ function findControlsGroup() {
   );
 }
 
+let syncPending = false;
+
+function scheduleSync() {
+  if (syncPending) return;
+  syncPending = true;
+  requestAnimationFrame(() => {
+    syncPending = false;
+    syncGraphPosition();
+  });
+}
+
 function syncGraphPosition() {
+  invalidateRects();
+
   const graph = document.getElementById("vodpulse-graph-container");
   if (!graph) return;
 
-  const seekbar =
-    document.querySelector(".seekbar-bar") ||
-    document.querySelector('[data-a-target="player-seekbar"]') ||
-    document.querySelector(".seekbar-interaction-area");
-
+  const seekbar = findSeekbar();
   if (!seekbar) return;
 
   const overlay = graph.parentElement;
@@ -402,6 +611,12 @@ function syncGraphPosition() {
 
 function clearUI() {
   graphData = null;
+  binCounts = null;
+  canvasCtx = null;
+  if (layoutObserver) {
+    layoutObserver.disconnect();
+    layoutObserver = null;
+  }
   document.getElementById("vodpulse-graph-container")?.remove();
   document.getElementById("vodpulse-btn-inject")?.remove();
   hideTooltip();
@@ -410,19 +625,11 @@ function clearUI() {
 const PULSE_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 3 9 21 6 12 2 12"/></svg>`;
 const CHECK_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 12 10 18 20 6"/></svg>`;
 
-function init() {
-  const videoId = getCurrentVideoId();
-  if (videoId !== lastVideoId) {
-    lastVideoId = videoId;
-    isFetching = false;
-    clearUI();
-  }
-  if (!videoId) return;
-
+function inject(videoId) {
   const controls = findControlsGroup();
   const overlay = document.querySelector(".video-player__overlay");
   const player = document.querySelector(".video-player__container");
-  if (!controls || !overlay || !player) return;
+  if (!controls || !overlay || !player) return false;
 
   // Pure CSS handles video-player idle/hover visibility of the graph container automatically
 
@@ -457,7 +664,7 @@ function init() {
         textEl.textContent = "Done";
         progressEl.style.width = "100%";
 
-        drawGraph(res.stamps, res.dur);
+        drawGraph(res.counts, res.dur);
 
         setTimeout(() => {
           btn.classList.remove("vodpulse-btn--done");
@@ -478,16 +685,56 @@ function init() {
     controls.appendChild(btn);
   }
 
-  if (!document.getElementById("vodpulse-graph-container")) {
-    const div = document.createElement("div");
-    div.id = "vodpulse-graph-container";
-    overlay.appendChild(div);
+  let container = document.getElementById("vodpulse-graph-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "vodpulse-graph-container";
+    overlay.appendChild(container);
 
-    overlay.addEventListener("mousemove", handleGraphMouseMove);
-    overlay.addEventListener("mouseleave", hideTooltip);
+    overlay.addEventListener("mousemove", handleGraphMouseMove, {
+      passive: true,
+    });
+    overlay.addEventListener("mouseenter", invalidateRects, { passive: true });
+    overlay.addEventListener("mouseleave", hideTooltip, { passive: true });
   }
 
+  if (layoutObserver) layoutObserver.disconnect();
+  layoutObserver = new ResizeObserver(() => {
+    invalidateRects();
+    scheduleSync();
+    scheduleRender();
+  });
+  layoutObserver.observe(container);
+  layoutObserver.observe(overlay);
+  const seekbar = findSeekbar();
+  if (seekbar) layoutObserver.observe(seekbar);
+
   syncGraphPosition();
+  return true;
 }
 
-setInterval(init, 500);
+// A pathname regex on every run; DOM work only until the UI is mounted.
+function tick() {
+  const videoId = getCurrentVideoId();
+
+  if (videoId !== lastVideoId) {
+    lastVideoId = videoId;
+    isFetching = false;
+    clearUI();
+  }
+  if (!videoId) return;
+
+  const btn = document.getElementById("vodpulse-btn-inject");
+  const graph = document.getElementById("vodpulse-graph-container");
+  if (btn?.isConnected && graph?.isConnected) return;
+
+  inject(videoId);
+}
+
+window.addEventListener("resize", invalidateRects, { passive: true });
+window.addEventListener("scroll", invalidateRects, {
+  passive: true,
+  capture: true,
+});
+
+setInterval(tick, 500);
