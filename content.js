@@ -12,6 +12,8 @@ const CONCURRENCY = 60;
 // (60 queries/round, median of 3): 1 -> 775ms, 5 -> 331ms, 10 -> 407ms,
 // 30 -> 620ms — the server handles a large batch serially.
 const GQL_BATCH = 5;
+// Remaining seconds below which a segment is not worth splitting off.
+const MIN_SPLIT = 30;
 
 let lastVideoId = null;
 let graphData = null;
@@ -248,22 +250,113 @@ async function fetchChat(id, onProgress) {
   const workerCount = Math.max(1, Math.min(CONCURRENCY, Math.ceil(dur / 60)));
   const segmentSize = Math.ceil(dur / workerCount);
 
+  const makeWorker = (start, end) => ({
+    start,
+    end,
+    offset: start,
+    emptyStreak: 0,
+    failures: 0,
+    prevIds: new Set(),
+    progress: 0,
+    done: false,
+    busy: false,
+  });
+
   const workers = [];
   for (let i = 0; i < workerCount; i++) {
     const start = i * segmentSize;
     const end = Math.min((i + 1) * segmentSize, dur);
     if (start >= end) continue;
-    workers.push({
-      start,
-      end,
-      offset: start,
-      emptyStreak: 0,
-      failures: 0,
-      prevIds: new Set(),
-      progress: 0,
-      done: false,
-    });
+    workers.push(makeWorker(start, end));
   }
+
+  // Hands a lane up to GQL_BATCH idle workers. When there are too few, the
+  // longest remaining segments are split in half: chat density is uneven, so
+  // equal segments would otherwise leave most of the pool idle while a few
+  // workers grind through the busy stretches.
+  const claim = () => {
+    const batch = [];
+    let active = 0;
+    for (let i = 0; i < workers.length; i++) {
+      const w = workers[i];
+      if (w.done) continue;
+      active++;
+      if (!w.busy && batch.length < GQL_BATCH) batch.push(w);
+    }
+
+    while (batch.length < GQL_BATCH && active < CONCURRENCY) {
+      let big = null;
+      for (let i = 0; i < workers.length; i++) {
+        const w = workers[i];
+        if (!w.done && (!big || w.end - w.offset > big.end - big.offset)) {
+          big = w;
+        }
+      }
+      if (!big || big.end - big.offset < MIN_SPLIT) break;
+
+      // Safe even while `big` is in flight: it only counts messages before
+      // its own `end`, and anything past it now belongs to the new worker.
+      const mid = Math.ceil((big.offset + big.end) / 2);
+      const w = makeWorker(mid, big.end);
+      big.end = mid;
+      workers.push(w);
+      batch.push(w);
+      active++;
+    }
+
+    for (let i = 0; i < batch.length; i++) batch[i].busy = true;
+    return batch;
+  };
+
+  // Cursor top-ups run one at a time beside the lanes instead of stalling
+  // them.
+  const drainQueue = [];
+  let draining = null;
+
+  const runDrains = async () => {
+    while (
+      drainQueue.length &&
+      cursorPagingAvailable &&
+      id === getCurrentVideoId()
+    ) {
+      const { second, ids } = drainQueue.shift();
+      const outcome = await drainSaturatedSecond(id, second, ids, counts);
+      if (outcome === "ok") truncatedSeconds--;
+      else if (outcome === "blocked") cursorPagingAvailable = false;
+    }
+    drainQueue.length = 0;
+  };
+
+  const queueDrain = (second, ids) => {
+    truncatedSeconds++;
+    if (!cursorPagingAvailable) return;
+    drainQueue.push({ second, ids });
+    if (!draining) {
+      draining = runDrains().finally(() => {
+        draining = null;
+      });
+    }
+  };
+
+  // Each lane keeps one request in flight and moves on as soon as it returns,
+  // so a slow or retried request holds up only its own batch.
+  const lane = async () => {
+    for (;;) {
+      if (id !== getCurrentVideoId()) return;
+      const batch = claim();
+      if (!batch.length) return;
+
+      const res = await gqlMulti(
+        batch.map((w) => buildCommentsQuery(id, w.offset)),
+      );
+      for (let i = 0; i < batch.length; i++) {
+        const w = batch[i];
+        w.busy = false;
+        const second = advanceWorker(w, res[i], counts);
+        if (second >= 0) queueDrain(second, w.prevIds);
+      }
+    }
+  };
 
   const report = () => {
     let total = 0;
@@ -273,51 +366,16 @@ async function fetchChat(id, onProgress) {
   const interval = setInterval(report, 400);
 
   try {
-    for (;;) {
-      if (id !== getCurrentVideoId()) return null;
-
-      const active = workers.filter((w) => !w.done);
-      if (!active.length) break;
-
-      const chunks = [];
-      for (let i = 0; i < active.length; i += GQL_BATCH) {
-        chunks.push(active.slice(i, i + GQL_BATCH));
-      }
-
-      const responses = await Promise.all(
-        chunks.map((chunk) =>
-          gqlMulti(chunk.map((w) => buildCommentsQuery(id, w.offset))),
-        ),
-      );
-
-      const saturated = [];
-      for (let c = 0; c < chunks.length; c++) {
-        const chunk = chunks[c];
-        const res = responses[c];
-        for (let i = 0; i < chunk.length; i++) {
-          const w = chunk[i];
-          const second = advanceWorker(w, res[i], counts);
-          if (second >= 0) saturated.push({ second, ids: w.prevIds });
-        }
-      }
-
-      // Try to top up seconds the page cap truncated.
-      for (let i = 0; i < saturated.length; i++) {
-        truncatedSeconds++;
-        if (!cursorPagingAvailable) continue;
-        const outcome = await drainSaturatedSecond(
-          id,
-          saturated[i].second,
-          saturated[i].ids,
-          counts,
-        );
-        if (outcome === "ok") truncatedSeconds--;
-        else if (outcome === "blocked") cursorPagingAvailable = false;
-      }
-    }
+    const lanes = [];
+    const laneCount = Math.ceil(CONCURRENCY / GQL_BATCH);
+    for (let i = 0; i < laneCount; i++) lanes.push(lane());
+    await Promise.all(lanes);
+    while (draining) await draining;
   } finally {
     clearInterval(interval);
   }
+
+  if (id !== getCurrentVideoId()) return null;
 
   report();
   if (truncatedSeconds > 0) {
@@ -556,10 +614,9 @@ function flushTooltip() {
   tooltipCount.textContent = `${count} messages`;
   tip.style.opacity = "1";
 
-  // Fixed vertical position just above seekbar, below hover preview card
-  tip.style.top = rect.bottom - 24 + "px";
-  tip.style.left = pendingMouseX + "px";
-  tip.style.transform = "translateX(-50%)";
+  // Fixed vertical position just above seekbar, below hover preview card.
+  // Moved with a transform so following the cursor skips layout.
+  tip.style.transform = `translate(${pendingMouseX}px, ${rect.bottom - 24}px) translateX(-50%)`;
 }
 
 function hideTooltip() {
