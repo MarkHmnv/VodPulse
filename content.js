@@ -449,23 +449,35 @@ function renderCanvas(container, counts, dur) {
     bins[i] += c;
   }
 
-  let max = 1;
-  for (let i = 0; i < numBins; i++) if (bins[i] > max) max = bins[i];
-
-  const ys = new Float64Array(numBins);
-  for (let i = 0; i < numBins; i++) {
-    ys[i] = H - Math.pow(bins[i] / max, 1.3) * (H - 2);
-  }
-
-  // Box blur via prefix sums: O(n) instead of O(n * window).
+  // Box blur of raw counts via prefix sums.
   const WINDOW = 2;
   const prefix = new Float64Array(numBins + 1);
-  for (let i = 0; i < numBins; i++) prefix[i + 1] = prefix[i] + ys[i];
-  const smoothY = new Float64Array(numBins);
+  for (let i = 0; i < numBins; i++) prefix[i + 1] = prefix[i] + bins[i];
+  const smooth = new Float64Array(numBins);
   for (let i = 0; i < numBins; i++) {
     const lo = i - WINDOW > 0 ? i - WINDOW : 0;
     const hi = i + WINDOW < numBins - 1 ? i + WINDOW : numBins - 1;
-    smoothY[i] = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
+    smooth[i] = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
+  }
+
+  // Subtract background, scale by a high percentile so quiet chats show spikes too.
+  const sorted = Float64Array.from(smooth).sort();
+  const pct = (p) =>
+    sorted[Math.min(numBins - 1, Math.floor(p * (numBins - 1)))];
+  const base = pct(0.3);
+  const max = sorted[numBins - 1];
+  let ref = pct(0.97) - base;
+  if (!(ref > 0)) ref = max - base;
+  if (!(ref > 0)) ref = 1;
+
+  // Linear up to KNEE, outliers compress softly into the rest.
+  const KNEE = 0.85;
+  const smoothY = new Float64Array(numBins);
+  for (let i = 0; i < numBins; i++) {
+    const v = Math.max(0, smooth[i] - base) / ref;
+    const n =
+      v <= 1 ? v * KNEE : KNEE + (1 - KNEE) * (1 - Math.exp(-(v - 1) * 1.5));
+    smoothY[i] = H - n * (H - 2);
   }
 
   // Build the path once and reuse it for all three passes.
